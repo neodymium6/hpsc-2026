@@ -59,8 +59,19 @@ __global__ void kernel(int dim_m, int dim_n, int dim_k,
   half (*block_a)[TILE_M + PAD] = reinterpret_cast<half(*)[TILE_M + PAD]>(smem);              // [2*TILE_K][TILE_M+PAD]
   half (*block_b)[TILE_K + PAD] = reinterpret_cast<half(*)[TILE_K + PAD]>(smem + 2 * A_BUF);  // [2*TILE_N][TILE_K+PAD]
 
-  int offset_a_m = TILE_M * blockIdx.x;
-  int offset_b_n = TILE_N * blockIdx.y;
+  // Threadblock swizzle: remap blocks so that temporally-adjacent blocks share
+  // A/B panels, improving L2 reuse. Bijection over all (bm,bn) -> correctness
+  // unchanged. Assumes gridDim.x is a multiple of SWIZZLE (80 = 10*8 here).
+  constexpr int SWIZZLE = 8;
+  int bid = blockIdx.y * gridDim.x + blockIdx.x;
+  int blocks_n = gridDim.y;
+  int blocks_per_group = SWIZZLE * blocks_n;
+  int group = bid / blocks_per_group;
+  int gidx = bid % blocks_per_group;
+  int bm = group * SWIZZLE + (gidx % SWIZZLE);
+  int bn = gidx / SWIZZLE;
+  int offset_a_m = TILE_M * bm;
+  int offset_b_n = TILE_N * bn;
   int tid = threadIdx.x;
   int warp_id = threadIdx.x / 32;
   int warp_m = warp_id / WARPS_N;
