@@ -4,11 +4,25 @@
 #include <stdint.h>
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
+#include <cuda_pipeline_primitives.h>
 #include <mma.h>
 #include <cmath>
 #include <chrono>
 using namespace std;
 using namespace nvcuda;
+
+// ---- tile shape (file scope so main() can size the dynamic shared memory) ----
+constexpr int TILE_M  = 128;
+constexpr int TILE_N  = 128;
+constexpr int TILE_K  = 64;
+constexpr int PAD     = 8;   // shared-memory padding to avoid bank conflicts (keeps 16B alignment)
+constexpr int VEC     = 8;   // 8 half = 16 B = one cp.async transaction
+constexpr int WMMA_M  = 16;
+constexpr int WMMA_N  = 16;
+constexpr int WARPS_N = 2;
+constexpr int A_BUF   = TILE_K * (TILE_M + PAD);     // half per A sub-buffer
+constexpr int B_BUF   = TILE_N * (TILE_K + PAD);     // half per B sub-buffer
+constexpr int SMEM_HALFS = 2 * A_BUF + 2 * B_BUF;    // double-buffered total
 
 __global__ void convert_to_half(int size, const float *src, half *dst) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -16,86 +30,75 @@ __global__ void convert_to_half(int size, const float *src, half *dst) {
     dst[idx] = __float2half(src[idx]);
 }
 
+// Issue async global->shared copies for the A and B tiles at global column kbase
+// into shared buffer `buf`. Assumes tile-aligned dims (m,n,k multiples of the tiles),
+// which holds for the fixed problem size below, so no bounds checks are needed.
+__device__ __forceinline__ void load_tile(half (*block_a)[TILE_M + PAD],
+                                          half (*block_b)[TILE_K + PAD],
+                                          const half *d_a, const half *d_b,
+                                          int dim_m, int dim_k,
+                                          int offset_a_m, int offset_b_n,
+                                          int buf, int kbase, int tid) {
+  for (int idx = tid; idx < TILE_K * TILE_M / VEC; idx += blockDim.x) {
+    int kk = idx / (TILE_M / VEC);
+    int mm = (idx % (TILE_M / VEC)) * VEC;
+    __pipeline_memcpy_async(&block_a[buf * TILE_K + kk][mm],
+                            &d_a[(kbase + kk) * dim_m + offset_a_m + mm], 16);
+  }
+  for (int idx = tid; idx < TILE_N * TILE_K / VEC; idx += blockDim.x) {
+    int nn = idx / (TILE_K / VEC);
+    int kk = (idx % (TILE_K / VEC)) * VEC;
+    __pipeline_memcpy_async(&block_b[buf * TILE_N + nn][kk],
+                            &d_b[(offset_b_n + nn) * dim_k + kbase + kk], 16);
+  }
+}
+
 __global__ void kernel(int dim_m, int dim_n, int dim_k,
 		       const half *d_a, const half *d_b, float *d_c) {
-  constexpr int TILE_M = 128;
-  constexpr int TILE_N = 128;
-  constexpr int TILE_K = 64;
-  constexpr int PAD = 8;
-  constexpr int VEC = 8;
-  constexpr int WMMA_M = 16;
-  constexpr int WMMA_N = 16;
-  constexpr int WARPS_N = 2;
+  extern __shared__ __align__(16) half smem[];
+  half (*block_a)[TILE_M + PAD] = reinterpret_cast<half(*)[TILE_M + PAD]>(smem);              // [2*TILE_K][TILE_M+PAD]
+  half (*block_b)[TILE_K + PAD] = reinterpret_cast<half(*)[TILE_K + PAD]>(smem + 2 * A_BUF);  // [2*TILE_N][TILE_K+PAD]
 
   int offset_a_m = TILE_M * blockIdx.x;
   int offset_b_n = TILE_N * blockIdx.y;
   int tid = threadIdx.x;
   int warp_id = threadIdx.x / 32;
-
-  __shared__ half __align__(16) block_a[TILE_K][TILE_M + PAD];
-  __shared__ half __align__(16) block_b[TILE_N][TILE_K + PAD];
-  struct __align__(16) half8_t { half v[VEC]; };
+  int warp_m = warp_id / WARPS_N;
+  int warp_n = warp_id % WARPS_N;
 
   wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][4];
   for (int r = 0; r < 2; r++)
     for (int c = 0; c < 4; c++)
       wmma::fill_fragment(acc[r][c], 0.0f);
 
-  int warp_m = warp_id / WARPS_N;
-  int warp_n = warp_id % WARPS_N;
+  int num_k = dim_k / TILE_K;
 
-  for (int k = 0; k < dim_k; k += TILE_K) {
-    __syncthreads();
+  // prologue: prefetch the first K-tile into buffer 0
+  load_tile(block_a, block_b, d_a, d_b, dim_m, dim_k, offset_a_m, offset_b_n, 0, 0, tid);
+  __pipeline_commit();
 
-    for (int idx = tid; idx < TILE_K * TILE_M / VEC; idx += blockDim.x) {
-      int kk = idx / (TILE_M / VEC);
-      int mm = (idx % (TILE_M / VEC)) * VEC;
-      int global_m = offset_a_m + mm;
-      int global_k = k + kk;
-      if (global_m + VEC <= dim_m && global_k < dim_k) {
-        *reinterpret_cast<half8_t*>(&block_a[kk][mm]) =
-          *reinterpret_cast<const half8_t*>(&d_a[global_k * dim_m + global_m]);
-      } else {
-        for (int v = 0; v < VEC; v++) {
-          int m = global_m + v;
-          block_a[kk][mm + v] = (m < dim_m && global_k < dim_k)
-            ? d_a[global_k * dim_m + m]
-            : __float2half(0.0f);
-        }
-      }
+  for (int kt = 0; kt < num_k; kt++) {
+    int cur = kt & 1;
+    __pipeline_wait_prior(0);   // current buffer is loaded
+    __syncthreads();            // make it visible to all warps
+
+    if (kt + 1 < num_k) {       // prefetch next tile into the other buffer (overlaps the compute below)
+      load_tile(block_a, block_b, d_a, d_b, dim_m, dim_k,
+                offset_a_m, offset_b_n, (kt + 1) & 1, (kt + 1) * TILE_K, tid);
+      __pipeline_commit();
     }
-
-    for (int idx = tid; idx < TILE_N * TILE_K / VEC; idx += blockDim.x) {
-      int nn = idx / (TILE_K / VEC);
-      int kk = (idx % (TILE_K / VEC)) * VEC;
-      int global_n = offset_b_n + nn;
-      int global_k = k + kk;
-      if (global_n < dim_n && global_k + VEC <= dim_k) {
-        *reinterpret_cast<half8_t*>(&block_b[nn][kk]) =
-          *reinterpret_cast<const half8_t*>(&d_b[global_n * dim_k + global_k]);
-      } else {
-        for (int v = 0; v < VEC; v++) {
-          int kk_global = global_k + v;
-          block_b[nn][kk + v] = (global_n < dim_n && kk_global < dim_k)
-            ? d_b[global_n * dim_k + kk_global]
-            : __float2half(0.0f);
-        }
-      }
-    }
-
-    __syncthreads();
 
     for (int kk = 0; kk < TILE_K; kk += 16) {
 #pragma unroll
       for (int r = 0; r < 2; r++) {
         int row_tile = warp_m * 2 + r;
         wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::col_major> a_frag;
-        wmma::load_matrix_sync(a_frag, &block_a[kk][row_tile * WMMA_M], TILE_M + PAD);
+        wmma::load_matrix_sync(a_frag, &block_a[cur * TILE_K + kk][row_tile * WMMA_M], TILE_M + PAD);
 #pragma unroll
         for (int c = 0; c < 4; c++) {
           int col_tile = warp_n * 4 + c;
           wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag;
-          wmma::load_matrix_sync(b_frag, &block_b[col_tile * WMMA_N][kk], TILE_K + PAD);
+          wmma::load_matrix_sync(b_frag, &block_b[cur * TILE_N + col_tile * WMMA_N][kk], TILE_K + PAD);
           wmma::mma_sync(acc[r][c], a_frag, b_frag, acc[r][c]);
         }
       }
@@ -170,14 +173,16 @@ int main(int argc, const char **argv) {
   int tile = 128;
   dim3 block = dim3(256);
   dim3 grid = dim3((m+tile-1)/tile, (n+tile-1)/tile);
+  int shmem_bytes = SMEM_HALFS * sizeof(half);
+  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_bytes);
   for (int i = 0; i < Nt+2; i++) {
     if (i == 2) tic = chrono::steady_clock::now();
-    kernel<<< grid, block >>>(m,
-			      n,
-			      k,
-			      Ahalf,
-			      Bhalf,
-			      C2);
+    kernel<<< grid, block, shmem_bytes >>>(m,
+				      n,
+				      k,
+				      Ahalf,
+				      Bhalf,
+				      C2);
     cudaDeviceSynchronize();
   }
   toc = chrono::steady_clock::now();
